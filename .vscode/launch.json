@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "CUDA Debug",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/cuda_playground",
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false
+        }
+    ]
+}
