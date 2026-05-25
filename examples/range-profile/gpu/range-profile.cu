@@ -65,8 +65,8 @@ class GpuTimer
         }
 };
 
-constexpr int NUM_PULSES = 128;
-constexpr int NUM_SAMPLES = 1024;
+constexpr int NUM_PULSES = 1024;
+constexpr int NUM_SAMPLES = 8192;
 
 constexpr float RANGE_FREQ = 0.08f;
 constexpr float DOPPLER_FREQ = 0.12f;
@@ -90,7 +90,9 @@ __global__ void generate_iq_data(cuFloatComplex* output, int pulses, int samples
     int sample_idx = thread_id % samples_per_pulse;
 
     float phase = 2.0f * M_PI * (range_freq * sample_idx + doppler_freq * pulse_idx);
-    output[thread_id] = make_cuFloatComplex(cosf(phase), sinf(phase));
+    float sinValue, cosValue;
+    __sincosf(phase, &sinValue, &cosValue);
+    output[thread_id] = make_cuFloatComplex(sinValue, cosValue);
 }
 
 __global__ void transpose(complex_t* input, complex_t* output, int rows, int cols)
@@ -168,7 +170,8 @@ int main()
     ////////////////////////////////////////////////////////////////////////////
     // Device Buffers
     ////////////////////////////////////////////////////////////////////////////
-
+    GpuTimer mainTimer;
+    mainTimer.start();
     complex_t* d_iq = nullptr;
     complex_t* d_transposed = nullptr;
     float* d_magnitude = nullptr;
@@ -372,6 +375,19 @@ int main()
             cudaMemcpyDeviceToHost));
 
     ////////////////////////////////////////////////////////////////////////////
+    // Cleanup
+    ////////////////////////////////////////////////////////////////////////////
+
+    cufftDestroy(range_plan);
+    cufftDestroy(doppler_plan);
+
+    cudaFree(d_iq);
+    cudaFree(d_transposed);
+    cudaFree(d_magnitude);
+    float mainTime = mainTimer.stop();
+    std::cout << "Done in " << mainTime << "ms\n";
+
+        ////////////////////////////////////////////////////////////////////////////
     // Export CSV
     ////////////////////////////////////////////////////////////////////////////
 
@@ -397,19 +413,6 @@ int main()
         NUM_SAMPLES,
         NUM_PULSES,
         output_path.string());
-
-    ////////////////////////////////////////////////////////////////////////////
-    // Cleanup
-    ////////////////////////////////////////////////////////////////////////////
-
-    cufftDestroy(range_plan);
-    cufftDestroy(doppler_plan);
-
-    cudaFree(d_iq);
-    cudaFree(d_transposed);
-    cudaFree(d_magnitude);
-
-    std::cout << "Done\n";
 
     return 0;
 }
