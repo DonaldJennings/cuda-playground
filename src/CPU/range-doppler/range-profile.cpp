@@ -2,6 +2,7 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <string>
 #include <thread>
 #include <fstream>
 
@@ -320,10 +321,17 @@ private:
     fftwf_plan doppler_plan{};
 };
 
-int main()
+int main(int argc, char* argv[])
 {
-    constexpr int pulses = 128;
-    constexpr int samples = 1024;
+    // Parse arguments for the pulses and samples and whether to run this as a benchmark or to export the range-Doppler map
+    if (argc < 4)
+    {
+        std::cerr << "Usage: " << argv[0] << " <pulses> <samples_per_pulse> <mode>\n";
+        return -1;
+    }
+    const int pulses = std::stoi(argv[1]);
+    const int samples = std::stoi(argv[2]);
+    std::string mode = argv[3];
 
     constexpr float range_freq = 0.08f;
     constexpr float doppler_freq = 0.12f;
@@ -336,9 +344,33 @@ int main()
         range_freq,
         doppler_freq);
 
-    processor.benchmark();
+    if (mode == "benchmark")
+    {
+        processor.benchmark();
+    }
+    else if (mode == "export")
+    {
+        std::chrono::high_resolution_clock::time_point start =
+            std::chrono::high_resolution_clock::now();
+        processor.process();
+        std::chrono::high_resolution_clock::time_point end =
+            std::chrono::high_resolution_clock::now();
 
-    processor.export_range_doppler_map();
+        double ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                end - start)
+                .count();
+
+        std::cout << "CPU Range-Doppler Time: "
+                  << ms
+                  << " ms\n";
+                  
+        processor.export_range_doppler_map();
+    }
+    else
+    {
+        std::cerr << "Invalid mode. Use 'benchmark' or 'export'.\n";
+        return -1;
+    }
 
     return 0;
 }
