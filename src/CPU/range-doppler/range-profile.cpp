@@ -7,12 +7,23 @@
 
 #include <fftw3.h>
 
+/**
+ * @brief RangeDopplerProcessor class encapsulates the entire process of generating synthetic IQ data,
+ * performing range and Doppler FFTs, and computing the magnitude of the range-Doppler map.
+ */
 class RangeDopplerProcessor
 {
 private:
     constexpr static float PI = 3.14159265358979323846f;
 
 public:
+    /**
+     * @brief Constructor for the RangeDopplerProcessor class. This constructor
+     * will preallocate memory for the input IQ data, intermediate FFT outputs, and the final magnitude array
+     * It also initializes the FFTW plans for both the range and Doppler FFTs.
+     * @param pulses The number of radar pulses (slow time dimension)
+     * @param samplesPerPulse The number of samples per pulse (fast time dimension)
+     */
     RangeDopplerProcessor(int pulses, int samplesPerPulse)
         : pulses(pulses),
           samplesPerPulse(samplesPerPulse),
@@ -44,9 +55,11 @@ public:
 
     ~RangeDopplerProcessor()
     {
+        // Clean up FFTW plans and free allocated memory
         fftwf_destroy_plan(range_plan);
         fftwf_destroy_plan(doppler_plan);
 
+        // Free the allocated memory for FFTW arrays
         fftwf_free(iq_data);
         fftwf_free(range_fft_output);
         fftwf_free(doppler_fft_output);
@@ -56,12 +69,21 @@ public:
         fftwf_cleanup_threads();
     }
 
+    /**
+     * @brief Generates synthetic IQ data for a single target with specified range and Doppler frequencies.
+     * The IQ data is generated using a simple model where the phase of the signal is determined by the range and Doppler frequencies, creating a sinusoidal pattern across both dimensions.
+     * @param range_freq The frequency component corresponding to the target's range (fast time)
+     * @param doppler_freq The frequency component corresponding to the target's Doppler shift (slow time)
+     */
     void generate_iq_data(float range_freq, float doppler_freq)
     {
+        // For each pulse and sample, compute the phase based on the range and Doppler frequencies
         for (int p = 0; p < pulses; ++p)
         {
             for (int s = 0; s < samplesPerPulse; ++s)
             {
+                // The phase is a combination of the range frequency (which varies with sample index) 
+                // and the Doppler frequency (which varies with pulse index)
                 float phase =
                     2.0f * PI *
                     (range_freq * static_cast<float>(s) +
@@ -69,12 +91,16 @@ public:
 
                 int idx = p * samplesPerPulse + s;
 
+                // Convert the phase to IQ components using cosine for the real part and sine for the imaginary part
                 iq_data[idx][0] = std::cos(phase);
                 iq_data[idx][1] = std::sin(phase);
             }
         }
     }
 
+    /**
+     * @brief Processes the IQ data through the range and Doppler FFTs.
+     */
     void process()
     {
         fftwf_execute(range_plan);
@@ -88,6 +114,11 @@ public:
         compute_magnitude();
     }
 
+    /**
+     * @brief Benchmarks the processing time of the range-Doppler algorithm by running it for a specified number of iterations
+     * and measuring the average execution time in milliseconds.
+     * @param iterations The number of times to run the process function for benchmarking (default is 100)
+     */
     void benchmark(int iterations = 100)
     {
         auto start = std::chrono::high_resolution_clock::now();
@@ -110,18 +141,21 @@ public:
     }
 
 private:
+    /**
+     * @brief Initialises the FFTW plans for both the range and Doppler FFTs. 
+     * The plans are created using the FFTW_MEASURE flag, which allows FFTW to optimize the execution plan based on the input size
+     * and hardware capabilities. The range FFT is planned to operate across the samples for each pulse, while the Doppler FFT is 
+     * planned to operate across the pulses after transposing the data. Multithreading is enabled to take advantage of multiple CPU 
+     * cores for faster execution.
+     */
     void initialise_plans()
     {
         fftwf_init_threads();
 
         fftwf_plan_with_nthreads(
             std::thread::hardware_concurrency());
-
-        /*
-         * RANGE FFT
-         * FFT across samples for each pulse
-         */
-
+        
+        // Range FFT
         int range_rank = 1;
         int range_n[] = { samplesPerPulse };
 
@@ -140,11 +174,7 @@ private:
             FFTW_FORWARD,
             FFTW_MEASURE);
 
-        /*
-         * DOPPLER FFT
-         * FFT across pulses after transpose
-         */
-
+        // Doppler FFT
         int doppler_rank = 1;
         int doppler_n[] = { pulses };
 
@@ -164,6 +194,12 @@ private:
             FFTW_MEASURE);
     }
 
+    /**
+     * @brief Function to transpose the range FFT output so that it can be used as input for the Doppler FFT. This is to enable
+     * row-major access patterns for the Doppler FFT, which operates across the pulses. 
+     * The transposition rearranges the data from a format where each pulse's samples are contiguous to a format where each 
+     * sample's pulses are contiguous.
+     */
     void transpose()
     {
         for (int p = 0; p < pulses; ++p)
@@ -182,6 +218,10 @@ private:
         }
     }
 
+    /**
+     * @brief Function to transpose the Doppler FFT output back to the original format. After the Doppler FFT is performed
+     * on the transposed data,
+     */
     void transpose_back()
     {
         for (int s = 0; s < samplesPerPulse; ++s)
@@ -200,6 +240,12 @@ private:
         }
     }
 
+    /**
+     * @brief Computes the magnitude of the range-Doppler map from the complex Doppler FFT output.
+     * The magnitude is calculated as the sum of squares of the real and imaginary parts for each complex value in the Doppler FFT output.
+     * This results in a real-valued array representing the power of the signal at each range and Doppler bin, which can be used for 
+     * further analysis or visualization.
+     */
     void compute_magnitude()
     {
         for (int i = 0; i < totalSamples; ++i)
@@ -211,46 +257,50 @@ private:
         }
     }
 
-    public:
-void export_range_doppler_map()
-{
-    std::ofstream file("range_doppler_map.csv");
-
-    if (!file.is_open())
-    {
-        std::cerr << "Error: Could not open file for writing\n";
-        return;
-    }
-
-    /*
-     * Export as dense matrix:
-     *
-     * Rows    -> Doppler bins
-     * Columns -> Range bins
+public:
+    /**
+     * @brief Exports the computed range-Doppler map to a CSV file. The output is formatted as a dense matrix where rows 
+     * correspond to Doppler bins and columns correspond to range bins.
      */
-
-    for (int p = 0; p < pulses; ++p)
+    void export_range_doppler_map()
     {
-        for (int s = 0; s < samplesPerPulse; ++s)
+        std::ofstream file("range_doppler_map.csv");
+    
+        if (!file.is_open())
         {
-            int idx = p * samplesPerPulse + s;
-
-            file << magnitude[idx];
-
-            if (s != samplesPerPulse - 1)
-            {
-                file << ",";
-            }
+            std::cerr << "Error: Could not open file for writing\n";
+            return;
         }
-
-        file << "\n";
+    
+        /*
+         * Export as dense matrix:
+         *
+         * Rows    -> Doppler bins
+         * Columns -> Range bins
+         */
+    
+        for (int p = 0; p < pulses; ++p)
+        {
+            for (int s = 0; s < samplesPerPulse; ++s)
+            {
+                int idx = p * samplesPerPulse + s;
+            
+                file << magnitude[idx];
+            
+                if (s != samplesPerPulse - 1)
+                {
+                    file << ",";
+                }
+            }
+        
+            file << "\n";
+        }
+    
+        file.close();
+    
+        std::cout << "Range-Doppler map exported to "
+                  << "range_doppler_map.csv\n";
     }
-
-    file.close();
-
-    std::cout << "Range-Doppler map exported to "
-              << "range_doppler_map.csv\n";
-}
 
 private:
     int pulses;
