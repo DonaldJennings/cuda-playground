@@ -33,12 +33,6 @@
 
 // ── Problem dimensions ─────────────────────────────────────────────────────────
 
-constexpr int   NUM_PULSES    = 1024;
-constexpr int   NUM_SAMPLES   = 8192;
-constexpr float RANGE_FREQ    = 0.08f;
-constexpr float DOPPLER_FREQ  = 0.12f;
-constexpr int   TOTAL_SAMPLES = NUM_PULSES * NUM_SAMPLES;
-
 using complex_t = cufftComplex;
 
 // Tile size for the shared-memory transpose kernel.
@@ -102,57 +96,6 @@ __global__ void k_generate_iq(
     out[p * samples_per_pulse + s] = make_cuFloatComplex(cos_v, sin_v);
 }
 
-// Tiled shared-memory transpose: [rows × cols] → [cols × rows].
-//
-// Bank-conflict analysis for complex_t (8 bytes):
-//   A single complex_t shared array with PAD=1 still yields 2-way conflicts
-//   because the row stride (33 × 8 = 264 bytes = 66 words) has GCD(66,32)=2.
-//
-//   Two separate float arrays with PAD=1 each give row stride 33 × 4 = 132
-//   bytes = 33 words. GCD(33,32)=1, so all 32 threads in a warp hit distinct
-//   banks → zero conflicts on both load and store paths.
-__global__ void k_transpose(
-    const complex_t* __restrict__ in,
-    complex_t* __restrict__       out,
-    int rows,   // NUM_PULSES  (input row count)
-    int cols)   // NUM_SAMPLES (input col count)
-{
-    __shared__ float tile_re[TILE][TILE + TILE_PAD];
-    __shared__ float tile_im[TILE][TILE + TILE_PAD];
-
-    // ── Load tile from global memory ──────────────────────────────────────────
-    // For a warp (fixed threadIdx.y, threadIdx.x = 0..31):
-    //   src_col varies by 1 per thread → 32 consecutive complex_t → coalesced.
-    const int src_col = blockIdx.x * TILE + threadIdx.x;
-    const int src_row = blockIdx.y * TILE + threadIdx.y;
-
-    if (src_col < cols && src_row < rows)
-    {
-        const complex_t v    = in[src_row * cols + src_col];
-        tile_re[threadIdx.y][threadIdx.x] = v.x;
-        tile_im[threadIdx.y][threadIdx.x] = v.y;
-    }
-
-    __syncthreads();
-
-    // ── Store tile to transposed global memory ────────────────────────────────
-    // threadIdx.x/y are swapped relative to the load so that the 32 consecutive
-    // threads in a warp write 32 consecutive output elements → coalesced.
-    // Reading tile_re[threadIdx.x][threadIdx.y]: threadIdx.x varies 0..31
-    // for fixed threadIdx.y → bank = (tx * 33 + ty) % 32 = (tx + ty) % 32
-    // → all 32 distinct banks → zero conflicts.
-    const int dst_col = blockIdx.y * TILE + threadIdx.x;
-    const int dst_row = blockIdx.x * TILE + threadIdx.y;
-
-    if (dst_col < rows && dst_row < cols)
-    {
-        complex_t r;
-        r.x = tile_re[threadIdx.x][threadIdx.y];
-        r.y = tile_im[threadIdx.x][threadIdx.y];
-        out[dst_row * rows + dst_col] = r;
-    }
-}
-
 // Amplitude of every complex element in the Doppler-FFT output.
 __global__ void k_magnitude(
     const complex_t* __restrict__ in,
@@ -165,13 +108,24 @@ __global__ void k_magnitude(
     out[i] = sqrtf(v.x * v.x + v.y * v.y);
 }
 
+// --- Radar Configuration struct with default parameters. Can be overridden via command-line args. ---
+
+struct RadarConfig
+{
+    int pulses = 1024;
+    int samples = 8192;
+    float range_freq = 0.08f;
+    float doppler_freq = 0.12f;
+
+    int iterations = 100;
+};
+
 // ── Per-stage timing breakdown ─────────────────────────────────────────────────
 
 struct PipelineTiming
 {
     float iq_gen_ms      = 0.f;
     float range_fft_ms   = 0.f;
-    float transpose_ms   = 0.f;
     float doppler_fft_ms = 0.f;
     float magnitude_ms   = 0.f;
     float total_ms       = 0.f;
@@ -187,7 +141,6 @@ struct PipelineTiming
         std::cout
             << "  IQ generation : " << std::setw(8) << iq_gen_ms      << " ms  (" << pct(iq_gen_ms)      << " %)\n"
             << "  Range FFT     : " << std::setw(8) << range_fft_ms   << " ms  (" << pct(range_fft_ms)   << " %)\n"
-            << "  Transpose     : " << std::setw(8) << transpose_ms   << " ms  (" << pct(transpose_ms)   << " %)\n"
             << "  Doppler FFT   : " << std::setw(8) << doppler_fft_ms << " ms  (" << pct(doppler_fft_ms) << " %)\n"
             << "  Magnitude     : " << std::setw(8) << magnitude_ms   << " ms  (" << pct(magnitude_ms)   << " %)\n"
             << "  ──────────────────────────────────────────────\n"
@@ -200,7 +153,7 @@ struct PipelineTiming
 class RangeDopplerProcessor
 {
 public:
-    RangeDopplerProcessor()
+    RangeDopplerProcessor(RadarConfig config = {}) : config_(config)
     {
         CUDA_CHECK(cudaStreamCreate(&stream_));
         allocate_buffers();
@@ -212,7 +165,6 @@ public:
         cufftDestroy(range_plan_);
         cufftDestroy(doppler_plan_);
         cudaFree(d_iq_);
-        cudaFree(d_transposed_);
         cudaFree(d_magnitude_);
         cudaFreeHost(h_magnitude_);
         cudaStreamDestroy(stream_);
@@ -243,24 +195,19 @@ public:
         t.range_fft_ms = timer.elapsed(stream_);
 
         timer.start(stream_);
-        launch_transpose();
-        t.transpose_ms = timer.elapsed(stream_);
-
-        timer.start(stream_);
-        CUFFT_CHECK(cufftExecC2C(doppler_plan_, d_transposed_, d_transposed_, CUFFT_FORWARD));
+        CUFFT_CHECK(cufftExecC2C(doppler_plan_, d_iq_, d_iq_, CUFFT_FORWARD));
         t.doppler_fft_ms = timer.elapsed(stream_);
 
         timer.start(stream_);
         launch_magnitude();
         t.magnitude_ms = timer.elapsed(stream_);
 
-        t.total_ms = t.iq_gen_ms + t.range_fft_ms + t.transpose_ms
-                   + t.doppler_fft_ms + t.magnitude_ms;
+        t.total_ms = t.iq_gen_ms + t.range_fft_ms + t.doppler_fft_ms + t.magnitude_ms;
 
         // Copy result to pinned host buffer via async DMA.
         CUDA_CHECK(cudaMemcpyAsync(
             h_magnitude_, d_magnitude_,
-            sizeof(float) * TOTAL_SAMPLES,
+            sizeof(float) * (config_.pulses * config_.samples),
             cudaMemcpyDeviceToHost, stream_));
         CUDA_CHECK(cudaStreamSynchronize(stream_));
 
@@ -284,7 +231,7 @@ public:
         // Rough bandwidth estimate: account for the dominant memory traffic –
         // two in-place FFT passes (~2 R+W each over 64 MB) + transpose (1R+1W)
         // + magnitude (1R + 0.5W) ≈ 5.5 passes × 64 MB = 352 MB per iteration.
-        const double bytes = 5.5 * TOTAL_SAMPLES * sizeof(complex_t);
+        const double bytes = 5.5 * (config_.pulses * config_.samples) * sizeof(complex_t);
         const double bw    = bytes / (avg_ms * 1e-3) / 1e9;
 
         std::cout << std::fixed << std::setprecision(3)
@@ -304,34 +251,23 @@ private:
         // One thread per (sample, pulse) pair. X-dimension covers samples so
         // writes within a warp are contiguous → coalesced.
         const dim3 threads(256, 1);
-        const dim3 blocks((NUM_SAMPLES + 255) / 256, NUM_PULSES);
+        const dim3 blocks((config_.samples + 255) / 256, config_.pulses);
         k_generate_iq<<<blocks, threads, 0, stream_>>>(
-            d_iq_, NUM_SAMPLES, RANGE_FREQ, DOPPLER_FREQ);
-    }
-
-    void launch_transpose()
-    {
-        const dim3 threads(TILE, TILE);
-        const dim3 blocks(
-            (NUM_SAMPLES + TILE - 1) / TILE,
-            (NUM_PULSES  + TILE - 1) / TILE);
-        k_transpose<<<blocks, threads, 0, stream_>>>(
-            d_iq_, d_transposed_, NUM_PULSES, NUM_SAMPLES);
+            d_iq_, config_.samples, config_.range_freq, config_.doppler_freq);
     }
 
     void launch_magnitude()
     {
-        const dim3 blocks((TOTAL_SAMPLES + 255) / 256);
+        const dim3 blocks((config_.pulses * config_.samples + 255) / 256);
         k_magnitude<<<blocks, 256, 0, stream_>>>(
-            d_transposed_, d_magnitude_, TOTAL_SAMPLES);
+            d_iq_, d_magnitude_, config_.pulses * config_.samples);
     }
 
     void run_pipeline()
     {
         launch_iq_gen();
         CUFFT_CHECK(cufftExecC2C(range_plan_, d_iq_, d_iq_, CUFFT_FORWARD));
-        launch_transpose();
-        CUFFT_CHECK(cufftExecC2C(doppler_plan_, d_transposed_, d_transposed_, CUFFT_FORWARD));
+        CUFFT_CHECK(cufftExecC2C(doppler_plan_, d_iq_, d_iq_, CUFFT_FORWARD));
         launch_magnitude();
     }
 
@@ -339,13 +275,12 @@ private:
 
     void allocate_buffers()
     {
-        CUDA_CHECK(cudaMalloc(&d_iq_,         sizeof(complex_t) * TOTAL_SAMPLES));
-        CUDA_CHECK(cudaMalloc(&d_transposed_, sizeof(complex_t) * TOTAL_SAMPLES));
-        CUDA_CHECK(cudaMalloc(&d_magnitude_,  sizeof(float)     * TOTAL_SAMPLES));
+        CUDA_CHECK(cudaMalloc(&d_iq_,         sizeof(complex_t) * (config_.pulses * config_.samples)));
+        CUDA_CHECK(cudaMalloc(&d_magnitude_,  sizeof(float)     * (config_.pulses * config_.samples)));
 
         // Pinned (page-locked) host buffer enables direct DMA for the DtH copy,
         // avoiding the driver's internal staging bounce through a pinned region.
-        CUDA_CHECK(cudaMallocHost(&h_magnitude_, sizeof(float) * TOTAL_SAMPLES));
+        CUDA_CHECK(cudaMallocHost(&h_magnitude_, sizeof(float) * (config_.pulses * config_.samples)));
     }
 
     void create_plans()
@@ -353,33 +288,34 @@ private:
         // Range FFT: NUM_PULSES batches of FFT-NUM_SAMPLES.
         // Data layout: d_iq_[p * NUM_SAMPLES + s] (pulse-major).
         {
-            int n[]   = { NUM_SAMPLES };
-            int emb[] = { NUM_SAMPLES };
+            int n[]   = { config_.samples };
+            int emb[] = { config_.samples };
             CUFFT_CHECK(cufftPlanMany(
                 &range_plan_, 1, n,
-                emb, /*istride=*/1, /*idist=*/NUM_SAMPLES,
-                emb, /*ostride=*/1, /*odist=*/NUM_SAMPLES,
-                CUFFT_C2C, /*batch=*/NUM_PULSES));
+                emb, /*istride=*/1, /*idist=*/config_.samples,
+                emb, /*ostride=*/1, /*odist=*/config_.samples,
+                CUFFT_C2C, /*batch=*/config_.pulses));
             CUFFT_CHECK(cufftSetStream(range_plan_, stream_));
         }
 
         // Doppler FFT: NUM_SAMPLES batches of FFT-NUM_PULSES.
         // Data layout after transpose: d_transposed_[s * NUM_PULSES + p] (sample-major).
         {
-            int n[]   = { NUM_PULSES };
-            int emb[] = { NUM_PULSES };
+            int n[]   = { config_.pulses };
+            int emb[] = { config_.pulses };
             CUFFT_CHECK(cufftPlanMany(
                 &doppler_plan_, 1, n,
-                emb, /*istride=*/1, /*idist=*/NUM_PULSES,
-                emb, /*ostride=*/1, /*odist=*/NUM_PULSES,
-                CUFFT_C2C, /*batch=*/NUM_SAMPLES));
+                emb, /*istride=*/config_.samples, /*idist=*/1,
+                emb, /*ostride=*/config_.samples, /*odist=*/1,
+                CUFFT_C2C, /*batch=*/config_.samples));
             CUFFT_CHECK(cufftSetStream(doppler_plan_, stream_));
         }
     }
 
+    RadarConfig config_;
+
     cudaStream_t stream_       = 0;
     complex_t*   d_iq_         = nullptr;
-    complex_t*   d_transposed_ = nullptr;
     float*       d_magnitude_  = nullptr;
     float*       h_magnitude_  = nullptr;
     cufftHandle  range_plan_   = 0;
@@ -417,10 +353,40 @@ static std::string timestamp()
     return ss.str();
 }
 
+
 // ── main ───────────────────────────────────────────────────────────────────────
 
-int main()
+int main(int argc, char* argv[])
 {
+    RadarConfig config;
+    if (argc > 1)
+    {
+        config.pulses = std::stoi(argv[1]);
+    }
+    if (argc > 2)
+    {
+        config.samples = std::stoi(argv[2]);
+    }
+    if (argc > 3)
+    {
+        config.range_freq = std::stof(argv[3]);
+    }
+    if (argc > 4)
+    {
+        config.doppler_freq = std::stof(argv[4]);
+    }
+    if (argc > 5)
+    {
+        config.iterations = std::stoi(argv[5]);
+    }
+
+    std::cout << "Radar Configuration:\n"
+              << "  Pulses       : " << config.pulses << '\n'
+              << "  Samples/Pulse: " << config.samples << '\n'
+              << "  Range Freq   : " << config.range_freq << '\n'
+              << "  Doppler Freq : " << config.doppler_freq << '\n'
+              << "  Iterations   : " << config.iterations << "\n\n";
+
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
 
@@ -428,7 +394,7 @@ int main()
               << "SMs    : " << prop.multiProcessorCount << '\n'
               << "SM arch: " << prop.major << '.' << prop.minor << "\n\n";
 
-    RangeDopplerProcessor proc;
+    RangeDopplerProcessor proc(config);
 
     std::cout << "Warming up...\n";
     proc.warmup();
@@ -447,7 +413,7 @@ int main()
     const fs::path out_path =
         out_dir / ("range_doppler_" + timestamp() + ".csv");
 
-    export_csv(proc.host_magnitude(), NUM_SAMPLES, NUM_PULSES, out_path.string());
+    export_csv(proc.host_magnitude(), config.pulses, config.samples, out_path.string());
 
     return 0;
 }
